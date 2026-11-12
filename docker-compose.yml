@@ -5,6 +5,12 @@ services:
     init: true
     ports:
       - "8000:8000"
+    # Hard cap: the checker streams position-delete replicas and must fit in
+    # 256 MiB even when a single row group holds millions of rows.
+    mem_limit: 256m
+    memswap_limit: 256m
     environment:
       MAX_UPLOAD_MB: "512"
+      # Bounded batch size used while streaming positional-delete files.
+      DELETE_BATCH_ROWS: "4096"
     restart: unless-stopped

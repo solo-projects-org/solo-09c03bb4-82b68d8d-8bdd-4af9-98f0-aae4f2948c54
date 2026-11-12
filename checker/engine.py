@@ -20,6 +20,7 @@ with a ``CheckError`` naming the exact file; no partial results are returned.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
@@ -33,6 +34,20 @@ from .manifest import FileKind, Manifest, ManifestEntry
 
 DELETE_PATH_COLUMN = "file_path"
 DELETE_POS_COLUMN = "pos"
+
+# Position-delete replicas can be far larger than the dimension being
+# investigated (a single row group may hold millions of rows).  Read them in
+# bounded batches so peak memory is independent of the file size.  Only rows
+# that reference a data-file occurrence of a requested ticket are retained.
+def _delete_batch_rows() -> int:
+    try:
+        value = int(os.environ.get("DELETE_BATCH_ROWS", "4096"))
+    except (TypeError, ValueError):
+        return 4096
+    return max(1, value)
+
+
+DELETE_BATCH_ROWS = _delete_batch_rows()
 
 
 @dataclass
@@ -248,10 +263,138 @@ def _bind_ticket_column(
         handle.column_index = column_index
 
 
+def _validate_delete_row(
+    *,
+    label: str,
+    source_row: int,
+    record_path: object,
+    record_pos: object,
+) -> tuple[str, int]:
+    """Validate one positional-delete row and return its match key.
+
+    The row number is the zero-based row in the whole delete file, not in the
+    batch or row group, so diagnostics keep pointing at the original evidence.
+    """
+    if record_path is None or str(record_path) == "":
+        raise CheckError(
+            f"位置删除文件 “{label}” 第 {source_row} 行（从 0 起算）"
+            "的 file_path 为空。",
+            files=[label],
+        )
+    if not isinstance(record_path, str):
+        raise CheckError(
+            f"位置删除文件 “{label}” 第 {source_row} 行（从 0 起算）"
+            "的 file_path 不是字符串。",
+            files=[label],
+        )
+    if record_pos is None or not isinstance(record_pos, int):
+        raise CheckError(
+            f"位置删除文件 “{label}” 第 {source_row} 行（从 0 起算）"
+            "的 pos 不是整数。",
+            files=[label],
+        )
+    if record_pos < 0:
+        raise CheckError(
+            f"位置删除文件 “{label}” 第 {source_row} 行（从 0 起算）"
+            f"的 pos={record_pos} 为负数。",
+            files=[label],
+        )
+    return record_path, record_pos
+
+
+def _stream_position_deletes(
+    parquet: pq.ParquetFile,
+    entry: ManifestEntry,
+    label: str,
+    candidate_keys: set[tuple[str, int]],
+    retained: dict[tuple[str, int], list[DeleteRecord]],
+) -> None:
+    """Stream one delete file in bounded batches and validate every row.
+
+    PyArrow's ``iter_batches`` reads row groups incrementally, so even a row
+    group with millions of rows is never materialised in full.  Deliberately
+    irrelevant rows are validated and then discarded instead of being added to
+    an in-memory index.
+    """
+    try:
+        metadata = parquet.metadata
+    except Exception as exc:  # pragma: no cover - opened by caller
+        raise CheckError(
+            f"无法读取位置删除文件 “{label}”（原始路径 "
+            f"{entry.original_path}）的元数据：{exc}",
+            files=[label],
+        ) from None
+
+    start_row = 0
+    for row_group_index in range(metadata.num_row_groups):
+        group_rows = int(metadata.row_group(row_group_index).num_rows)
+        batch_start = start_row
+        try:
+            batches = parquet.iter_batches(
+                batch_size=DELETE_BATCH_ROWS,
+                row_groups=[row_group_index],
+                columns=[DELETE_PATH_COLUMN, DELETE_POS_COLUMN],
+                use_threads=False,
+            )
+            for batch in batches:
+                if batch.num_rows == 0:
+                    continue
+                path_column = batch.column(
+                    batch.schema.get_field_index(DELETE_PATH_COLUMN)
+                )
+                pos_column = batch.column(
+                    batch.schema.get_field_index(DELETE_POS_COLUMN)
+                )
+                paths = path_column.to_pylist()
+                positions = pos_column.to_pylist()
+                for offset, (record_path, record_pos) in enumerate(
+                    zip(paths, positions)
+                ):
+                    source_row = batch_start + offset
+                    key = _validate_delete_row(
+                        label=label,
+                        source_row=source_row,
+                        record_path=record_path,
+                        record_pos=record_pos,
+                    )
+                    if key in candidate_keys:
+                        retained.setdefault(key, []).append(
+                            DeleteRecord(
+                                entry=entry, source_row=source_row
+                            )
+                        )
+                batch_start += batch.num_rows
+        except CheckError:
+            raise
+        except Exception as exc:
+            raise CheckError(
+                f"无法读取位置删除文件 “{label}”（原始路径 "
+                f"{entry.original_path}）的行组 {row_group_index}：{exc}",
+                files=[label],
+            ) from None
+        if batch_start != start_row + group_rows:
+            raise CheckError(
+                f"位置删除文件 “{label}” 的行组 {row_group_index} 元数据说 "
+                f"{group_rows} 行，实际读取 {batch_start - start_row} 行。"
+                "无法可靠计算删除记录的原始行号。",
+                files=[label],
+            )
+        start_row += group_rows
+
+
 def _load_position_deletes(
-    manifest: Manifest, uploaded_paths: Mapping[str, Path]
+    manifest: Manifest,
+    uploaded_paths: Mapping[str, Path],
+    candidate_keys: set[tuple[str, int]],
 ) -> dict[tuple[str, int], list[DeleteRecord]]:
-    index: dict[tuple[str, int], list[DeleteRecord]] = {}
+    """Return only delete rows that reference a requested ticket occurrence.
+
+    Every row of every positional-delete replica is still validated: an
+    invalid record anywhere aborts the check even when a matching delete was
+    already found.  Rows unrelated to the requested tickets are discarded
+    batch by batch, keeping memory proportional to the number of matches.
+    """
+    retained: dict[tuple[str, int], list[DeleteRecord]] = {}
     for entry in manifest.position_delete_files:
         path = uploaded_paths[entry.uploaded_filename]
         label = entry.uploaded_filename
@@ -266,9 +409,6 @@ def _load_position_deletes(
                 file_label=label,
                 role="删除文件",
             )
-            table = parquet.read(
-                columns=[DELETE_PATH_COLUMN, DELETE_POS_COLUMN]
-            )
         except CheckError:
             raise
         except Exception as exc:
@@ -277,42 +417,10 @@ def _load_position_deletes(
                 f"{entry.original_path}）：{exc}",
                 files=[label],
             ) from None
-
-        # These files are normally small, and the index has to be complete
-        # before any conclusion is produced.
-        paths = table.column(DELETE_PATH_COLUMN).to_pylist()
-        positions = table.column(DELETE_POS_COLUMN).to_pylist()
-        for row_index, (record_path, record_pos) in enumerate(
-            zip(paths, positions)
-        ):
-            if record_path is None or str(record_path) == "":
-                raise CheckError(
-                    f"位置删除文件 “{label}” 第 {row_index} 行（从 0 起算）"
-                    "的 file_path 为空。",
-                    files=[label],
-                )
-            if not isinstance(record_path, str):
-                raise CheckError(
-                    f"位置删除文件 “{label}” 第 {row_index} 行（从 0 起算）"
-                    "的 file_path 不是字符串。",
-                    files=[label],
-                )
-            if record_pos is None or not isinstance(record_pos, int):
-                raise CheckError(
-                    f"位置删除文件 “{label}” 第 {row_index} 行（从 0 起算）"
-                    "的 pos 不是整数。",
-                    files=[label],
-                )
-            if record_pos < 0:
-                raise CheckError(
-                    f"位置删除文件 “{label}” 第 {row_index} 行（从 0 起算）"
-                    f"的 pos={record_pos} 为负数。",
-                    files=[label],
-                )
-            index.setdefault((record_path, record_pos), []).append(
-                DeleteRecord(entry=entry, source_row=row_index)
-            )
-    return index
+        _stream_position_deletes(
+            parquet, entry, label, candidate_keys, retained
+        )
+    return retained
 
 
 def _extract_stats(column_metadata) -> tuple[bool, int | None, int | None]:
@@ -373,7 +481,6 @@ def _scan_file(
     handle: _DataHandle,
     ticket: int,
     ticket_column: str,
-    delete_index: Mapping[tuple[str, int], list[DeleteRecord]],
 ) -> tuple[FileScan, list[Occurrence]]:
     file_scan = FileScan(file_entry=handle.entry, row_groups=[])
     occurrences: list[Occurrence] = []
@@ -446,26 +553,6 @@ def _scan_file(
                         row_group_start=start_row,
                         local_row_index=local_index,
                     )
-                    for record in delete_index.get(
-                        (handle.entry.original_path, row_index), []
-                    ):
-                        if (
-                            record.entry.sequence_number
-                            >= handle.entry.sequence_number
-                        ):
-                            occurrence.matched_deletes.append(record)
-                        else:
-                            occurrence.ignored_deletes.append(
-                                IgnoredDelete(
-                                    record=record,
-                                    reason=(
-                                        "删除文件的数据序列号 "
-                                        f"{record.entry.sequence_number} 小于"
-                                        "数据文件的 "
-                                        f"{handle.entry.sequence_number}"
-                                    ),
-                                )
-                            )
                     occurrences.append(occurrence)
 
         file_scan.row_groups.append(row_scan)
@@ -513,23 +600,30 @@ def run_check(
     _check_presence(manifest, uploaded_paths)
     data_handles = _open_data_files(manifest, uploaded_paths)
     _bind_ticket_column(data_handles, ticket_column)
-    delete_index = _load_position_deletes(manifest, uploaded_paths)
 
     referenced = {entry.uploaded_filename for entry in manifest.entries}
     unused_uploads = sorted(
         name for name in uploaded_paths if name not in referenced
     )
 
+    # Phase 1: scan the data files for the requested tickets.  This yields
+    # the complete set of (original data path, zero-based row) candidates that
+    # a positional delete could address, before any delete file is opened.
     results: list[TicketResult] = []
+    candidate_keys: set[tuple[str, int]] = set()
     for ticket in dict.fromkeys(tickets):
         file_scans: list[FileScan] = []
         occurrences: list[Occurrence] = []
         for handle in data_handles:
             scan, file_occurrences = _scan_file(
-                handle, ticket, ticket_column, delete_index
+                handle, ticket, ticket_column
             )
             file_scans.append(scan)
             occurrences.extend(file_occurrences)
+        for occurrence in occurrences:
+            candidate_keys.add(
+                (occurrence.file_entry.original_path, occurrence.row_index)
+            )
         results.append(
             TicketResult(
                 ticket=ticket,
@@ -537,6 +631,38 @@ def run_check(
                 file_scans=file_scans,
             )
         )
+
+    # Phase 2: stream every positional-delete replica in bounded batches.
+    # Only candidate keys are retained; every row is still validated so an
+    # invalid record aborts the whole check even after a delete was found.
+    delete_index = _load_position_deletes(
+        manifest, uploaded_paths, candidate_keys
+    )
+
+    # Phase 3: apply the manifest's path / row / sequence-number rule to the
+    # retained evidence and attach it to each occurrence.
+    for result in results:
+        for occurrence in result.occurrences:
+            for record in delete_index.get(
+                (occurrence.file_entry.original_path, occurrence.row_index), []
+            ):
+                if (
+                    record.entry.sequence_number
+                    >= occurrence.file_entry.sequence_number
+                ):
+                    occurrence.matched_deletes.append(record)
+                else:
+                    occurrence.ignored_deletes.append(
+                        IgnoredDelete(
+                            record=record,
+                            reason=(
+                                "删除文件的数据序列号 "
+                                f"{record.entry.sequence_number} 小于"
+                                "数据文件的 "
+                                f"{occurrence.file_entry.sequence_number}"
+                            ),
+                        )
+                    )
 
     rows: list[ManifestRow] = []
     for entry in manifest.entries:

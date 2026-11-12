@@ -303,3 +303,165 @@ def test_tickets_are_deduplicated_in_input_order():
     manifest, uploads = sample_inputs()
     result = run_check(manifest, uploads, [4242, 1003, 4242])
     assert [t.ticket for t in result.tickets] == [4242, 1003]
+
+
+def _write_data_with_tickets(path: Path) -> None:
+    tickets = (
+        list(range(1000, 1020))
+        + list(range(2000, 2020))
+        + list(range(3000, 3020))
+        + list(range(4000, 4020))
+        + list(range(4200, 4219))
+        + [4242]
+    )
+    pq.write_table(
+        pa.table({"ticket_no": pa.array(tickets, type=pa.int64())}),
+        path,
+        row_group_size=20,
+    )
+
+
+def test_large_single_row_group_delete_is_streamed(tmp_path: Path):
+    """Two million rows in one row group, only a few relevant records."""
+    base = "s3://bucket/voyage"
+    data_path = f"{base}/data/data-0001.parquet"
+    delete_path = f"{base}/delete-pos/delete-pos-0001.parquet"
+    data = tmp_path / "data-0001.parquet"
+    delete = tmp_path / "delete-pos-0001.parquet"
+    _write_data_with_tickets(data)
+
+    rows = 2_000_000
+    # The relevant evidence is at the very end of the single row group.
+    extra_paths = [data_path, data_path, "s3://bucket/voyage/data/other.parquet"]
+    extra_pos = [3, 99, 99]
+    filler = rows - len(extra_paths)
+    paths = pa.concat_arrays(
+        [
+            pa.repeat(pa.scalar("s3://bucket/voyage/data/other.parquet"), filler),
+            pa.array(extra_paths, type=pa.string()),
+        ]
+    )
+    positions = pa.concat_arrays(
+        [
+            pa.array(range(filler), type=pa.int64()),
+            pa.array(extra_pos, type=pa.int64()),
+        ]
+    )
+    pq.write_table(
+        pa.table({"file_path": paths, "pos": positions}),
+        delete,
+        row_group_size=rows,
+    )
+    assert pq.ParquetFile(delete).metadata.num_row_groups == 1
+
+    manifest = parse_manifest(
+        "original_path,uploaded_filename,file_type,data_sequence_number\n"
+        f"{data_path},data-0001.parquet,data,7\n"
+        f"{delete_path},delete-pos-0001.parquet,position_delete,12\n"
+    )
+    result = run_check(
+        manifest,
+        {"data-0001.parquet": data, "delete-pos-0001.parquet": delete},
+        [4242, 1003],
+    )
+
+    first = result.tickets[0]
+    assert first.ticket == 4242
+    assert first.found and first.deleted
+    assert first.occurrences[0].row_index == 99
+    # Delete-file row numbers span the whole file, despite batch streaming.
+    assert [
+        match.source_row for match in first.occurrences[0].matched_deletes
+    ] == [rows - 2]
+    # Paths that do not belong to a requested occurrence are not retained.
+    assert first.occurrences[0].ignored_deletes == []
+
+    second = result.tickets[1]
+    assert second.ticket == 1003
+    assert second.found and second.deleted
+    assert second.occurrences[0].row_index == 3
+    assert [
+        match.source_row for match in second.occurrences[0].matched_deletes
+    ] == [rows - 3]
+
+
+def test_delete_source_row_spans_multiple_row_groups(tmp_path: Path):
+    base = "s3://bucket/voyage"
+    data_path = f"{base}/data/data.parquet"
+    delete_path = f"{base}/delete-pos/delete.parquet"
+    data = tmp_path / "data.parquet"
+    delete = tmp_path / "delete.parquet"
+    # Ticket 60 is the second row of the third row group (global row 5).
+    pq.write_table(
+        pa.table(
+            {
+                "ticket_no": pa.array(
+                    [10, 20, 30, 40, 50, 60], type=pa.int64()
+                )
+            }
+        ),
+        data,
+        row_group_size=2,
+    )
+    pq.write_table(
+        pa.table(
+            {
+                "file_path": [f"{base}/data/other.parquet"] * 5 + [data_path],
+                "pos": pa.array([0, 1, 2, 3, 4, 5], type=pa.int64()),
+            }
+        ),
+        delete,
+        row_group_size=2,
+    )
+    assert pq.ParquetFile(delete).metadata.num_row_groups == 3
+
+    manifest = parse_manifest(
+        "original_path,uploaded_filename,file_type,data_sequence_number\n"
+        f"{data_path},data.parquet,data,1\n"
+        f"{delete_path},delete.parquet,position_delete,2\n"
+    )
+    result = run_check(
+        manifest,
+        {"data.parquet": data, "delete.parquet": delete},
+        [60],
+    )
+    occurrence = result.tickets[0].occurrences[0]
+    assert occurrence.row_index == 5
+    assert occurrence.deleted
+    assert occurrence.matched_deletes[0].source_row == 5
+
+
+def test_invalid_delete_row_after_match_aborts_with_original_row(
+    tmp_path: Path,
+):
+    base = "s3://bucket/voyage"
+    data_path = f"{base}/data/data-0001.parquet"
+    delete_path = f"{base}/delete-pos/delete-pos-0001.parquet"
+    data = tmp_path / "data-0001.parquet"
+    delete = tmp_path / "delete-pos-0001.parquet"
+    _write_data_with_tickets(data)
+    pq.write_table(
+        pa.table(
+            {
+                "file_path": [data_path, "s3://bucket/voyage/data/other.parquet"],
+                "pos": pa.array([3, None], type=pa.int64()),
+            }
+        ),
+        delete,
+    )
+    manifest = parse_manifest(
+        "original_path,uploaded_filename,file_type,data_sequence_number\n"
+        f"{data_path},data-0001.parquet,data,7\n"
+        f"{delete_path},delete-pos-0001.parquet,position_delete,12\n"
+    )
+    # Row 0 gives a matching delete for ticket 1003; row 1 is invalid.  The
+    # all-or-nothing rule must still abort and name the file and row.
+    with pytest.raises(CheckError) as excinfo:
+        run_check(
+            manifest,
+            {"data-0001.parquet": data, "delete-pos-0001.parquet": delete},
+            [1003],
+        )
+    assert "delete-pos-0001.parquet" in excinfo.value.files
+    assert "第 1 行" in excinfo.value.message
+    assert "pos" in excinfo.value.message

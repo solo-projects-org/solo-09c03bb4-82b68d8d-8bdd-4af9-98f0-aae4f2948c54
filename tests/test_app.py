@@ -3,11 +3,14 @@ from __future__ import annotations
 import io
 from pathlib import Path
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from app import app
 
 SAMPLE = Path(__file__).resolve().parents[1] / "sample"
+BASE = "s3://ferry-lake/warehouse/settlement/voyage_date=2026-11-05"
 
 
 @pytest.fixture()
@@ -167,3 +170,54 @@ def test_duplicate_uploaded_name_is_rejected(client):
     html = response.get_data(as_text=True)
     assert response.status_code == 400
     assert "上传文件名重复" in html
+
+
+def test_invalid_delete_record_after_match_returns_no_results(
+    client, tmp_path: Path
+):
+    # Ticket 1003 has matching delete evidence in row 0, but row 1 has a null
+    # pos.  The page must show the error and suppress all ticket conclusions.
+    delete = tmp_path / "invalid-delete.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "file_path": [f"{BASE}/data/data-0001.parquet", "x"],
+                "pos": pa.array([3, None], type=pa.int64()),
+            }
+        ),
+        delete,
+    )
+    manifest_text = (
+        "original_path,uploaded_filename,file_type,data_sequence_number\n"
+        f"{BASE}/data/data-0001.parquet,data-0001.parquet,data,7\n"
+        f"{BASE}/delete-pos/invalid-delete.parquet,invalid-delete.parquet,"
+        "position_delete,12\n"
+    )
+    response = client.post(
+        "/check",
+        data={
+            "manifest": (io.BytesIO(manifest_text.encode()), "manifest.csv"),
+            "files": [
+                (
+                    io.BytesIO((SAMPLE / "data-0001.parquet").read_bytes()),
+                    "data-0001.parquet",
+                    "application/octet-stream",
+                ),
+                (
+                    io.BytesIO(delete.read_bytes()),
+                    "invalid-delete.parquet",
+                    "application/octet-stream",
+                ),
+            ],
+            "tickets": "1003",
+            "ticket_column": "ticket_no",
+        },
+        content_type="multipart/form-data",
+    )
+    html = response.get_data(as_text=True)
+    assert response.status_code == 400
+    assert "核对未完成" in html
+    assert "invalid-delete.parquet" in html
+    assert "第 1 行" in html
+    assert "<h2>核对结果</h2>" not in html
+    assert 'class="ticket-card' not in html
